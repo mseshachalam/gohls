@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -32,7 +33,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/groupcache/lru"
 	"github.com/grafov/m3u8"
 	// "github.com/kr/pretty"
 )
@@ -62,6 +62,7 @@ type Download struct {
 	SeqNo         uint64
 	ExtXKey       *m3u8.Key
 	totalDuration time.Duration
+	Headers       map[string]string
 }
 
 func DecryptData(data []byte, v *Download, aes128Keys *map[string][]byte) {
@@ -72,7 +73,6 @@ func DecryptData(data []byte, v *Download, aes128Keys *map[string][]byte) {
 	)
 
 	if v.ExtXKey != nil && (v.ExtXKey.Method == "AES-128" || v.ExtXKey.Method == "aes-128") {
-
 		keyData = (*aes128Keys)[v.ExtXKey.URI]
 
 		if keyData == nil {
@@ -105,8 +105,8 @@ func DownloadSegment(fn string, dlc chan *Download, recTime time.Duration) {
 		return
 	}
 	var (
-		data       []byte
-		aes128Keys = &map[string][]byte{}
+	// data       []byte
+	// aes128Keys = &map[string][]byte{}
 	)
 
 	for v := range dlc {
@@ -114,27 +114,32 @@ func DownloadSegment(fn string, dlc chan *Download, recTime time.Duration) {
 		if err != nil {
 			log.Fatal(err)
 		}
+		for h, k := range v.Headers {
+			println(h, " - ", k)
+			req.Header.Add(h, k)
+		}
 		resp, err := DoRequest(Client, req)
 		if err != nil {
 			log.Print(err)
 			continue
 		}
-		if resp.StatusCode != 200 {
-			log.Printf("Received HTTP %v for %v\n", resp.StatusCode, v.URI)
-			continue
-		}
+		// if resp.StatusCode != 200 {
+		// 	log.Printf("Received HTTP %v for %v\n", resp.StatusCode, v.URI)
+		// 	continue
+		// }
 
-		data, _ = ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
+		// data, _ = ioutil.ReadAll(resp.Body)
+		// resp.Body.Close()
 
-		DecryptData(data, v, aes128Keys)
+		// DecryptData(data, v, aes128Keys)
 
-		_, err = out.Write(data)
+		// _, err = out.Write(data)
 
-		// _, err = io.Copy(out, resp.Body)
+		_, err = io.Copy(out, resp.Body)
 		if err != nil {
 			log.Fatal(err)
 		}
+		resp.Body.Close()
 
 		log.Printf("Downloaded %v\n", v.URI)
 		if recTime != 0 {
@@ -148,7 +153,6 @@ func DownloadSegment(fn string, dlc chan *Download, recTime time.Duration) {
 func GetPlaylist(urlStr string, recTime time.Duration, useLocalTime bool, dlc chan *Download) {
 	startTime := time.Now()
 	var recDuration time.Duration = 0
-	cache := lru.New(1024)
 	playlistUrl, err := url.Parse(urlStr)
 	if err != nil {
 		log.Fatal(err)
@@ -170,10 +174,13 @@ func GetPlaylist(urlStr string, recTime time.Duration, useLocalTime bool, dlc ch
 		resp.Body.Close()
 		if listType == m3u8.MEDIA {
 			mpl := playlist.(*m3u8.MediaPlaylist)
-
+			var next int64 = 0
+			var msURI string
+			var segmentIndex int
+			var u *m3u8.MediaSegment
 			for segmentIndex, v := range mpl.Segments {
 				if v != nil {
-					var msURI string
+					u = v
 					if strings.HasPrefix(v.URI, "http") {
 						msURI, err = url.QueryUnescape(v.URI)
 						if err != nil {
@@ -190,26 +197,37 @@ func GetPlaylist(urlStr string, recTime time.Duration, useLocalTime bool, dlc ch
 							log.Fatal(err)
 						}
 					}
-					_, hit := cache.Get(msURI)
-					if !hit {
-						cache.Add(msURI, nil)
-						if useLocalTime {
-							recDuration = time.Now().Sub(startTime)
-						} else {
-							recDuration += time.Duration(int64(v.Duration * 1000000000))
-						}
-						dlc <- &Download{
-							URI:           msURI,
-							ExtXKey:       mpl.Key,
-							SeqNo:         uint64(segmentIndex) + mpl.SeqNo,
-							totalDuration: recDuration,
-						}
+					if useLocalTime {
+						recDuration = time.Now().Sub(startTime)
+					} else {
+						recDuration += time.Duration(int64(v.Duration * 1000000000))
+					}
+					var headers map[string]string
+					headers = map[string]string{
+						"Range": fmt.Sprintf("bytes=%d-%d", next, v.Offset-1),
+					}
+					next = v.Offset
+					dlc <- &Download{
+						URI:           msURI,
+						ExtXKey:       mpl.Key,
+						SeqNo:         uint64(segmentIndex) + mpl.SeqNo,
+						totalDuration: recDuration,
+						Headers:       headers,
 					}
 					if recTime != 0 && recDuration != 0 && recDuration >= recTime {
 						close(dlc)
 						return
 					}
 				}
+			}
+			headers := map[string]string{
+				"Range": fmt.Sprintf("bytes=%d-%d", next, next+u.Limit-1),
+			}
+			dlc <- &Download{
+				URI:     msURI,
+				ExtXKey: mpl.Key,
+				SeqNo:   uint64(segmentIndex) + mpl.SeqNo,
+				Headers: headers,
 			}
 			if mpl.Closed {
 				close(dlc)
